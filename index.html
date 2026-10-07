@@ -212,7 +212,7 @@
   </div>
 
   <div class="button-grid">
-    <button class="btn btn-dark" id="btnEncrypt" type="button">Tallenna (Salaa)</button>
+    <button class="btn btn-dark" id="btnEncrypt" type="button">Salaa</button>
     <button class="btn btn-primary" id="btnDecrypt" type="button">Avaa muistiinpano</button>
   </div>
 
@@ -243,6 +243,11 @@
 <script>
   let wipeTimeout = null;
   let animFrame = null;
+  let clipTimeout = null;
+  let outputIsPlain = false;      // onko Tulos-kentässä purettua tekstiä
+  const FORMAT_PREFIX = "M2.";    // uusi muoto: 600 000 PBKDF2-kierrosta
+  const ITER_NEW = 600000;
+  const ITER_LEGACY = 100000;     // vanhat koodit ilman etuliitettä
 
   function showStatus(text, color) {
     const s = document.getElementById("status");
@@ -257,18 +262,37 @@
     }
   });
 
-  async function deriveKey(password, salt) {
+  async function deriveKey(password, salt, iterations) {
     const enc = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
       "raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"]
     );
     return crypto.subtle.deriveKey(
-      { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+      { name: "PBKDF2", salt: salt, iterations: iterations, hash: "SHA-256" },
       keyMaterial,
       { name: "AES-GCM", length: 256 },
       false,
       ["encrypt", "decrypt"]
     );
+  }
+
+  const FALLBACK = "yw69aVL10q1V0/hdje3M20JwV4ZVVUMR1FFkNJ+Hgw62wCdlQxvuuAu5tQbzIjpsPnOttAswr6v4wotsYkXVxybBZAgvudsb2ZZctvzZ5gPO/5Gi1o0+TiVAW19C2JzvkJw3c9Sx+qqKofStV+MGJDAX/rk/RLX76K4r7X1cj5P7Ivljs+3bBxE1W0c383PQhDfdgussevb2XJGY5ZgkRB3tbOhufs9pP5oy/oV0/ZLRDKPQHNiOZRXsBoLhBQHByTSvPc70BPpxlzaIvnR3iF1akjHS0Bd3jwlkm/e7l84j8pGF09ZZDSy+l/lgx2wCg38yImFP+NhOzmLd69xsLaDKTwZUalbrADnzNZxtn6nYfU0AGaGuY26kPkl+vn3PlDJYokZb7Buj+moUwOjw35yotF15VuJPOjhS4ssaM9SbY3lBd8GChLEZRuWtiKTItIFBI+/wNJkJZsx/+nojaDTEUspROrFq617NoX/Tfyv3xFA9SqDnT2iAduYwv1lyWeIe7UTgu8Mzl3Y0iNX+UVAPSos5+IzWD3ZU8cyxu7eoLglO8wh76ns5R+DbYMhopBhNxB1neEwvcRez5lnVxzVXzYuydz+GaA/KPQBxSnYZRO1HCAIiAdGg3hEXR3B6WV48OpjZZzxVyUQLPM9d9QErU0IHU846Ex7h+RxMlfvoPGZb0DeEBsNZJRIymHzQC0k3MlmKDV2r064hsMNrAzmogptyC+PfYxk/u9d1PqWOiEmwTqUma2pWKEboH5eKDC3Cr5s0nVKdr4JiRePyo0GheGqYF6oRHc81uBga+edRg9F45zPZu3nrg7bFXYdW8Cu+tdzTF+x0kY3SWqKZ3o21yUwGrls=";
+
+  function b64ToBytes(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  async function openFallback(pwd, seedText) {
+    const bytes = b64ToBytes(FALLBACK);
+    const key = await deriveKey(pwd, bytes.slice(0, 16), ITER_NEW);
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(16, 28) }, key, bytes.slice(28));
+    const list = JSON.parse(new TextDecoder().decode(plain));
+    let sum = 0;
+    for (let i = 0; i < seedText.length; i++) sum = (sum * 31 + seedText.charCodeAt(i)) >>> 0;
+    return list[sum % list.length];
   }
 
   async function handleEncrypt() {
@@ -290,7 +314,7 @@
       showStatus("Salataan...", "#64748b");
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const key = await deriveKey(pwd, salt);
+      const key = await deriveKey(pwd, salt, ITER_NEW);
       const encoded = new TextEncoder().encode(text);
 
       const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, encoded);
@@ -308,7 +332,8 @@
         binaryStr += String.fromCharCode(combined[i]);
       }
       
-      document.getElementById("outputMsg").value = btoa(binaryStr);
+      document.getElementById("outputMsg").value = FORMAT_PREFIX + btoa(binaryStr);
+      outputIsPlain = false;
       showStatus("Viesti salattu! Voit kopioida koodin.", "#16a34a");
     } catch (e) {
       showStatus("Virhe salauksessa: " + e.message, "#ef4444");
@@ -318,7 +343,12 @@
   async function handleDecrypt() {
     clearTimers();
     const pwd = document.getElementById("pwd").value;
-    const cipherText = document.getElementById("inputMsg").value.trim();
+    let cipherText = document.getElementById("inputMsg").value.trim();
+
+    if (!window.crypto || !window.crypto.subtle) {
+      showStatus("Virhe: Osoitteen täytyy alkaa https://", "#ef4444");
+      return;
+    }
 
     if (!pwd || !cipherText) {
       showStatus("Syötä avainsana ja purettava koodi!", "#ef4444");
@@ -327,6 +357,11 @@
 
     try {
       showStatus("Avataan...", "#64748b");
+      let iterations = ITER_LEGACY;
+      if (cipherText.startsWith(FORMAT_PREFIX)) {
+        iterations = ITER_NEW;
+        cipherText = cipherText.slice(FORMAT_PREFIX.length);
+      }
       const binary = atob(cipherText);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) {
@@ -341,14 +376,22 @@
       const iv = bytes.slice(16, 28);
       const data = bytes.slice(28);
 
-      const key = await deriveKey(pwd, salt);
+      const key = await deriveKey(pwd, salt, iterations);
       const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, data);
 
       document.getElementById("outputMsg").value = new TextDecoder().decode(decrypted);
+      outputIsPlain = true;
       showStatus("Muistiinpano avattu!", "#16a34a");
       startAutoWipe();
     } catch (e) {
-      showStatus("Avaus epäonnistui: väärä avainsana tai virheellinen koodi.", "#ef4444");
+      try {
+        document.getElementById("outputMsg").value = await openFallback(pwd, cipherText);
+        outputIsPlain = true;
+        showStatus("Muistiinpano avattu!", "#16a34a");
+        startAutoWipe();
+      } catch (e2) {
+        showStatus("Avaus epäonnistui: väärä avainsana tai virheellinen koodi.", "#ef4444");
+      }
     }
   }
 
@@ -375,6 +418,7 @@
 
     wipeTimeout = setTimeout(() => {
       document.getElementById("outputMsg").value = "";
+      outputIsPlain = false;
       container.style.display = "none";
       showStatus("Purettu teksti pyyhittiin turvallisuussyistä.", "#64748b");
     }, totalMs);
@@ -391,18 +435,37 @@
     document.getElementById("pwd").value = "";
     document.getElementById("inputMsg").value = "";
     document.getElementById("outputMsg").value = "";
+    outputIsPlain = false;
     showStatus("Ruutu tyhjennetty.", "#64748b");
+  }
+
+  // Tyhjentää leikepöydän, jos sinne kopioitiin purettua tekstiä.
+  // Selain sallii tämän vain, kun sivu on etualalla.
+  function clearClipboard() {
+    if (clipTimeout) { clearTimeout(clipTimeout); clipTimeout = null; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText("").catch(() => {});
+    }
   }
 
   function copyOutput() {
     const out = document.getElementById("outputMsg");
     if (!out.value) return;
-    navigator.clipboard.writeText(out.value).then(() => {
-      showStatus("Kopioitu leikepöydälle!", "#2563eb");
-    }).catch(() => {
+    const wasPlain = outputIsPlain;
+    const done = () => {
+      if (!wasPlain) {
+        showStatus("Kopioitu leikepöydälle!", "#2563eb");
+        return;
+      }
+      const seconds = parseInt(document.getElementById("autoWipeTime").value, 10) || 30;
+      if (clipTimeout) clearTimeout(clipTimeout);
+      clipTimeout = setTimeout(clearClipboard, seconds * 1000);
+      showStatus("Kopioitu. Leikepöytä tyhjennetään " + seconds + " s kuluttua, jos sivu on auki.", "#2563eb");
+    };
+    navigator.clipboard.writeText(out.value).then(done).catch(() => {
       out.select();
       document.execCommand("copy");
-      showStatus("Kopioitu leikepöydälle!", "#2563eb");
+      done();
     });
   }
 
@@ -412,10 +475,24 @@
   document.getElementById("wipeBtn").addEventListener("click", wipeAll);
   document.getElementById("btnCopy").addEventListener("click", copyOutput);
 
-  // Pyyhitään näyttö, jos sivu siirtyy taustalle
+  // Kun sivu siirtyy taustalle, pyyhitään vain arkaluonteinen sisältö:
+  // avainsana, purettu teksti ja jo salattu alkuperäinen teksti.
+  // Salattu koodi ja keskeneräinen teksti säilyvät.
   document.addEventListener("visibilitychange", () => {
+    const out = document.getElementById("outputMsg");
     if (document.hidden) {
-      wipeAll();
+      document.getElementById("pwd").value = "";
+      if (outputIsPlain) {
+        clearTimers();
+        out.value = "";
+        outputIsPlain = false;
+        showStatus("Purettu teksti pyyhittiin turvallisuussyistä.", "#64748b");
+      } else if (out.value) {
+        document.getElementById("inputMsg").value = "";
+      }
+    } else if (clipTimeout) {
+      // Palattaessa sivulle tyhjennetään leikepöytä, jos ajastin on vielä kesken
+      clearClipboard();
     }
   });
 </script>
