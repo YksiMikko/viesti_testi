@@ -172,9 +172,10 @@
     }
 
     .status-text {
-      font-size: 0.8rem;
+      font-size: 0.85rem;
       text-align: center;
-      min-height: 1.2em;
+      min-height: 1.4em;
+      font-weight: 500;
     }
 
     .settings-row {
@@ -197,7 +198,7 @@
 <div class="app-container">
   <div class="header">
     <div class="app-title">📝 Muistiinpanot</div>
-    <button class="wipe-btn" onclick="wipeAll()">Tyhjennä ruutu</button>
+    <button class="wipe-btn" id="wipeBtn" type="button">Tyhjennä ruutu</button>
   </div>
 
   <div class="field-group">
@@ -211,8 +212,8 @@
   </div>
 
   <div class="button-grid">
-    <button class="btn btn-dark" onclick="handleEncrypt()">Tallenna (Salaa)</button>
-    <button class="btn btn-primary" onclick="handleDecrypt()">Avaa muistiinpano</button>
+    <button class="btn btn-dark" id="btnEncrypt" type="button">Tallenna (Salaa)</button>
+    <button class="btn btn-primary" id="btnDecrypt" type="button">Avaa muistiinpano</button>
   </div>
 
   <div class="field-group">
@@ -224,7 +225,7 @@
     <div class="timer-bar" id="timerBar"></div>
   </div>
 
-  <button class="btn btn-secondary" onclick="copyOutput()">Kopioi leikepöydälle</button>
+  <button class="btn btn-secondary" id="btnCopy" type="button">Kopioi leikepöydälle</button>
 
   <div class="settings-row">
     <span>Automaattinen tyhjennys:</span>
@@ -232,4 +233,192 @@
       <option value="15">15 sekuntia</option>
       <option value="30" selected>30 sekuntia</option>
       <option value="60">1 minuutti</option>
-      <option value="0">Pois päältä</option
+      <option value="0">Pois päältä</option>
+    </select>
+  </div>
+
+  <div id="status" class="status-text"></div>
+</div>
+
+<script>
+  let wipeTimeout = null;
+  let animFrame = null;
+
+  function showStatus(text, color) {
+    const s = document.getElementById("status");
+    s.innerText = text;
+    s.style.color = color;
+  }
+
+  // Tarkistetaan heti sivun latautuessa, että selain sallii kryptografian
+  window.addEventListener("DOMContentLoaded", () => {
+    if (!window.crypto || !window.crypto.subtle) {
+      showStatus("Huom: Selain vaatii HTTPS-yhteyden salaukseen!", "#ef4444");
+    }
+  });
+
+  async function deriveKey(password, salt) {
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"]
+    );
+    return crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+      keyMaterial,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  }
+
+  async function handleEncrypt() {
+    clearTimers();
+    const pwd = document.getElementById("pwd").value;
+    const text = document.getElementById("inputMsg").value;
+
+    if (!window.crypto || !window.crypto.subtle) {
+      showStatus("Virhe: Osoitteen täytyy alkaa https://", "#ef4444");
+      return;
+    }
+
+    if (!pwd || !text) {
+      showStatus("Syötä avainsana ja teksti!", "#ef4444");
+      return;
+    }
+
+    try {
+      showStatus("Salataan...", "#64748b");
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await deriveKey(pwd, salt);
+      const encoded = new TextEncoder().encode(text);
+
+      const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, encoded);
+      const cipherBytes = new Uint8Array(cipher);
+      const combined = new Uint8Array(salt.length + iv.length + cipherBytes.length);
+
+      combined.set(salt, 0);
+      combined.set(iv, salt.length);
+      combined.set(cipherBytes, salt.length + iv.length);
+
+      // Base64-pakkaus
+      let binaryStr = "";
+      const len = combined.byteLength;
+      for (let i = 0; i < len; i++) {
+        binaryStr += String.fromCharCode(combined[i]);
+      }
+      
+      document.getElementById("outputMsg").value = btoa(binaryStr);
+      showStatus("Viesti salattu! Voit kopioida koodin.", "#16a34a");
+    } catch (e) {
+      showStatus("Virhe salauksessa: " + e.message, "#ef4444");
+    }
+  }
+
+  async function handleDecrypt() {
+    clearTimers();
+    const pwd = document.getElementById("pwd").value;
+    const cipherText = document.getElementById("inputMsg").value.trim();
+
+    if (!pwd || !cipherText) {
+      showStatus("Syötä avainsana ja purettava koodi!", "#ef4444");
+      return;
+    }
+
+    try {
+      showStatus("Avataan...", "#64748b");
+      const binary = atob(cipherText);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+
+      if (bytes.length < 28) {
+        throw new Error("Liian lyhyt koodi");
+      }
+
+      const salt = bytes.slice(0, 16);
+      const iv = bytes.slice(16, 28);
+      const data = bytes.slice(28);
+
+      const key = await deriveKey(pwd, salt);
+      const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, data);
+
+      document.getElementById("outputMsg").value = new TextDecoder().decode(decrypted);
+      showStatus("Muistiinpano avattu!", "#16a34a");
+      startAutoWipe();
+    } catch (e) {
+      showStatus("Avaus epäonnistui: väärä avainsana tai virheellinen koodi.", "#ef4444");
+    }
+  }
+
+  function startAutoWipe() {
+    const seconds = parseInt(document.getElementById("autoWipeTime").value, 10);
+    if (seconds <= 0) return;
+
+    const bar = document.getElementById("timerBar");
+    const container = document.getElementById("timerContainer");
+    container.style.display = "block";
+
+    let start = performance.now();
+    let totalMs = seconds * 1000;
+
+    function frame(now) {
+      let elapsed = now - start;
+      let rem = Math.max(0, 1 - (elapsed / totalMs));
+      bar.style.transform = `scaleX(${rem})`;
+      if (elapsed < totalMs) {
+        animFrame = requestAnimationFrame(frame);
+      }
+    }
+    animFrame = requestAnimationFrame(frame);
+
+    wipeTimeout = setTimeout(() => {
+      document.getElementById("outputMsg").value = "";
+      container.style.display = "none";
+      showStatus("Purettu teksti pyyhittiin turvallisuussyistä.", "#64748b");
+    }, totalMs);
+  }
+
+  function clearTimers() {
+    if (wipeTimeout) clearTimeout(wipeTimeout);
+    if (animFrame) cancelAnimationFrame(animFrame);
+    document.getElementById("timerContainer").style.display = "none";
+  }
+
+  function wipeAll() {
+    clearTimers();
+    document.getElementById("pwd").value = "";
+    document.getElementById("inputMsg").value = "";
+    document.getElementById("outputMsg").value = "";
+    showStatus("Ruutu tyhjennetty.", "#64748b");
+  }
+
+  function copyOutput() {
+    const out = document.getElementById("outputMsg");
+    if (!out.value) return;
+    navigator.clipboard.writeText(out.value).then(() => {
+      showStatus("Kopioitu leikepöydälle!", "#2563eb");
+    }).catch(() => {
+      out.select();
+      document.execCommand("copy");
+      showStatus("Kopioitu leikepöydälle!", "#2563eb");
+    });
+  }
+
+  // Tapahtumakuuntelijat suoraan napeille
+  document.getElementById("btnEncrypt").addEventListener("click", handleEncrypt);
+  document.getElementById("btnDecrypt").addEventListener("click", handleDecrypt);
+  document.getElementById("wipeBtn").addEventListener("click", wipeAll);
+  document.getElementById("btnCopy").addEventListener("click", copyOutput);
+
+  // Pyyhitään näyttö, jos sivu siirtyy taustalle
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      wipeAll();
+    }
+  });
+</script>
+
+</body>
+</html>
